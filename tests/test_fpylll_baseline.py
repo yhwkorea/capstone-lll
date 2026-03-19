@@ -24,7 +24,7 @@ def random_basis(dim: int, bits: int) -> IntegerMatrix:
     A = IntegerMatrix(dim, dim)
     for i in range(dim):
         for j in range(dim):
-            A[i][j] = random.randint(-(2**bits), 2**bits)
+            A[i, j] = random.randint(-(2**bits), 2**bits)  # fpylll: A[i,j] not A[i][j]
     return A
 
 
@@ -43,7 +43,7 @@ def run_lll_and_measure(A: IntegerMatrix):
 
 
 def test_correctness():
-    """LLL 후 기저가 size-reduced인지 기본 확인"""
+    """LLL 후 기저가 size-reduced + Lovász 조건 만족하는지 확인"""
     print("=== Correctness check ===")
     A = random_basis(DIMENSION, BIT_SIZE)
     B = IntegerMatrix(A)
@@ -80,9 +80,9 @@ def test_timing_distribution():
     타이밍 분포 측정 — 상수 시간 구현 검증의 사전 기준선.
     C++ ct_reduce_dim4 구현 후 이 분포와 비교한다.
 
-    이상적인 constant-time 구현은:
+    이상적인 constant-time 구현:
       - std_dev / mean < 0.05 (5% 이내)
-      - 최대값 / 최솟값 < 2.0
+      - max / min < 2.0
     """
     print(f"=== Timing distribution (n={NUM_TRIALS}, dim={DIMENSION}, bits={BIT_SIZE}) ===")
 
@@ -95,21 +95,19 @@ def test_timing_distribution():
         norms.append(norm_sq)
 
     mean_t = statistics.mean(timings)
-    std_t = statistics.stdev(timings)
-    min_t = min(timings)
-    max_t = max(timings)
+    std_t  = statistics.stdev(timings)
+    min_t  = min(timings)
+    max_t  = max(timings)
 
     print(f"  Time (ns): mean={mean_t:.0f}  std={std_t:.0f}  min={min_t}  max={max_t}")
-    print(f"  Coefficient of variation: {std_t/mean_t*100:.1f}%")
-    print(f"  Max/Min ratio: {max_t/min_t:.2f}x")
+    print(f"  Coefficient of variation : {std_t/mean_t*100:.1f}%")
+    print(f"  Max/Min ratio            : {max_t/min_t:.2f}x")
     print()
 
     mean_norm = statistics.mean(norms)
-    print(f"  First vector norm² mean: {mean_norm:.0f}")
+    print(f"  First vector norm² mean  : {mean_norm:.0f}")
     print()
-
-    # 기준선 저장 (C++ 구현 비교용)
-    print("  [baseline] Save these numbers to compare with C++ ct_reduce_dim4")
+    print("  [baseline] compare these with C++ ct_reduce_dim4 output")
     print(f"  mean_ns={mean_t:.0f}  std_ns={std_t:.0f}  mean_norm_sq={mean_norm:.0f}")
 
 
