@@ -64,12 +64,12 @@ static void cholesky_update(const Mat4 &G, GSO4 &gso, int ell, int rho) {
 
 // ---------------------------------------------------------------------------
 // Single size-reduction step: b_i -= round(mu[i][j]) * b_j
-// Unconditional (no branch on mu_r) — always executes the same instructions.
+// Always executes same instructions (no branch on mu_r value).
 // ---------------------------------------------------------------------------
 
 static void size_red_step(Mat4 &B, Mat4 &G, GSO4 &gso, int i, int j) {
     int64_t mu_r = (int64_t)std::round(gso.mu[i][j]);
-    // No early-out: always run (constant-time). mu_r==0 -> no-op on all values.
+    // No early-out: mu_r==0 -> all subtractions are noops (constant-time intent)
 
     int64_t g_ij = G[i][j];
     int64_t g_jj = G[j][j];
@@ -92,24 +92,31 @@ static void size_red_step(Mat4 &B, Mat4 &G, GSO4 &gso, int i, int j) {
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm 3.2 — size_red
-// One pass from j=i-1 down to 0. In BKZ context the outer tour loop provides
-// convergence. For safety, repeat until fully reduced (at most dim passes).
+// Algorithm 3.2 — size_red for one vector
+// Sweeps j = i-1 downto 0, repeating until fully size-reduced.
 // ---------------------------------------------------------------------------
 
 static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
-    // Repeat up to i+1 times to ensure full size reduction
-    // (each pass might reintroduce violations in earlier columns)
     for (int pass = 0; pass <= i; pass++) {
-        bool changed = false;
+        bool any = false;
         for (int j = i - 1; j >= 0; j--) {
-            double mu_val = gso.mu[i][j];
-            if (std::abs(mu_val) > 0.5 + 1e-10) {
+            if (std::abs(gso.mu[i][j]) > 0.5 + 1e-10) {
                 size_red_step(B, G, gso, i, j);
-                changed = true;
+                any = true;
             }
         }
-        if (!changed) break;
+        if (!any) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full size reduction: reduce all vectors 1..n-1 in order
+// ---------------------------------------------------------------------------
+
+static void full_size_red(Mat4 &B, Mat4 &G, GSO4 &gso) {
+    for (int i = 1; i < 4; i++) {
+        cholesky_update(G, gso, i, i);
+        size_red(B, G, gso, i);
     }
 }
 
@@ -156,13 +163,11 @@ static Mat2 lagrange(double H00, double H10, double H11, int T) {
         U[1][0] -= mu * U[0][0];
         U[1][1] -= mu * U[0][1];
 
-        // Unconditional swap (no branch)
         std::swap(H00, H11);
         ct_cswap64(U[0][0], U[1][0], 1);
         ct_cswap64(U[0][1], U[1][1], 1);
     }
 
-    // Final sort (branch-free via cmov-style)
     uint64_t need_swap = (uint64_t)(H11 < H00);
     ct_cswap64(U[0][0], U[1][0], need_swap);
     ct_cswap64(U[0][1], U[1][1], need_swap);
@@ -223,6 +228,10 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
             size_red(B, G, gso, i + 1);
         }
     }
+
+    // Final full size-reduction pass to ensure all |mu[i][j]| <= 1/2
+    // (Lagrange + update may leave later vectors not fully reduced)
+    full_size_red(B, G, gso);
 }
 
 // ---------------------------------------------------------------------------
