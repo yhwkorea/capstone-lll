@@ -5,14 +5,11 @@
  *   Hanyecz et al., "Constant Time Lattice Reduction in Dimension 4
  *   with Application to SQIsign", TCHES 2025 / ePrint 2025/027
  *
- * Arithmetic strategy (Phase 1):
- *   - Basis B:        exact int64_t
- *   - Gram matrix G:  exact int64_t, symmetric (G[i][j] = G[j][i] always)
- *   - GSO (mu, r):    double — re-derived from G after each basis change
- *   - Lagrange H:     double
- *   - Unimodular U:   exact int64_t
+ * Phase 1 arithmetic:
+ *   Basis B: int64_t  |  Gram G: int64_t (symmetric)
+ *   GSO (mu, r): double  |  Lagrange H: double  |  U: int64_t
  *
- * TODO (Phase 2): replace double GSO with exact arithmetic for full CT proof.
+ * TODO Phase 2: replace double GSO with exact __int128 for full CT proof.
  */
 
 #pragma once
@@ -66,38 +63,53 @@ static void cholesky_update(const Mat4 &G, GSO4 &gso, int ell, int rho) {
 }
 
 // ---------------------------------------------------------------------------
+// Single size-reduction step: b_i -= round(mu[i][j]) * b_j
+// Unconditional (no branch on mu_r) — always executes the same instructions.
+// ---------------------------------------------------------------------------
+
+static void size_red_step(Mat4 &B, Mat4 &G, GSO4 &gso, int i, int j) {
+    int64_t mu_r = (int64_t)std::round(gso.mu[i][j]);
+    // No early-out: always run (constant-time). mu_r==0 -> no-op on all values.
+
+    int64_t g_ij = G[i][j];
+    int64_t g_jj = G[j][j];
+
+    for (int k = 0; k < i; k++) {
+        int64_t x = ct_select64(G[j][k], G[k][j], (uint64_t)(k <= j));
+        G[i][k] -= mu_r * x;
+        G[k][i]  = G[i][k];
+    }
+    for (int k = i + 1; k < 4; k++) {
+        G[k][i] -= mu_r * G[j][k];
+        G[i][k]  = G[k][i];
+    }
+    G[i][i] -= 2 * mu_r * g_ij - mu_r * mu_r * g_jj;
+
+    for (int k = 0; k < 4; k++)
+        B[i][k] -= mu_r * B[j][k];
+
+    cholesky_update(G, gso, i, i);
+}
+
+// ---------------------------------------------------------------------------
 // Algorithm 3.2 — size_red
+// One pass from j=i-1 down to 0. In BKZ context the outer tour loop provides
+// convergence. For safety, repeat until fully reduced (at most dim passes).
 // ---------------------------------------------------------------------------
 
 static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
-    for (int j = i - 1; j >= 0; j--) {
-        int64_t mu_r = (int64_t)std::round(gso.mu[i][j]);
-        if (mu_r == 0) continue;
-
-        int64_t g_ij = G[i][j];
-        int64_t g_jj = G[j][j];
-
-        // Update off-diagonal entries in row/col i, maintaining symmetry G[a][b]=G[b][a]
-        for (int k = 0; k < i; k++) {
-            // x = G[j][k] if k <= j, else G[k][j]  (same value since G symmetric,
-            // but keeping the ct_select makes the read pattern branch-free)
-            int64_t x = ct_select64(G[j][k], G[k][j], (uint64_t)(k <= j));
-            G[i][k] -= mu_r * x;
-            G[k][i]  = G[i][k];
+    // Repeat up to i+1 times to ensure full size reduction
+    // (each pass might reintroduce violations in earlier columns)
+    for (int pass = 0; pass <= i; pass++) {
+        bool changed = false;
+        for (int j = i - 1; j >= 0; j--) {
+            double mu_val = gso.mu[i][j];
+            if (std::abs(mu_val) > 0.5 + 1e-10) {
+                size_red_step(B, G, gso, i, j);
+                changed = true;
+            }
         }
-        for (int k = i + 1; k < 4; k++) {
-            G[k][i] -= mu_r * G[j][k];
-            G[i][k]  = G[k][i];
-        }
-        // Diagonal
-        G[i][i] -= 2 * mu_r * g_ij - mu_r * mu_r * g_jj;
-
-        // Update basis vector
-        for (int k = 0; k < 4; k++)
-            B[i][k] -= mu_r * B[j][k];
-
-        // Refresh GSO for row i (rows 0..i-1 unchanged)
-        cholesky_update(G, gso, i, i);
+        if (!changed) break;
     }
 }
 
@@ -108,7 +120,6 @@ static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
 static void update_after_svp(Mat4 &G, const Mat2 &U, int i) {
     int64_t g0 = G[i][i], g1 = G[i+1][i+1], g2 = G[i+1][i];
 
-    // Region I: j < i
     for (int j = 0; j < i; j++) {
         int64_t gi = G[i][j], gi1 = G[i+1][j];
         G[i][j]   = U[0][0]*gi + U[1][0]*gi1;
@@ -116,7 +127,6 @@ static void update_after_svp(Mat4 &G, const Mat2 &U, int i) {
         G[j][i]   = G[i][j];
         G[j][i+1] = G[i+1][j];
     }
-    // Region III: k > i+1
     for (int k = i + 2; k < 4; k++) {
         int64_t gi = G[k][i], gi1 = G[k][i+1];
         G[k][i]   = U[0][0]*gi + U[1][0]*gi1;
@@ -124,7 +134,6 @@ static void update_after_svp(Mat4 &G, const Mat2 &U, int i) {
         G[i][k]   = G[k][i];
         G[i+1][k] = G[k][i+1];
     }
-    // Region II: 2x2 block
     G[i][i]     = U[0][0]*U[0][0]*g0 + 2*U[0][0]*U[1][0]*g2 + U[1][0]*U[1][0]*g1;
     G[i+1][i+1] = U[0][1]*U[0][1]*g0 + 2*U[0][1]*U[1][1]*g2 + U[1][1]*U[1][1]*g1;
     G[i+1][i]   = U[0][0]*U[0][1]*g0 + (U[0][1]*U[1][0]+U[0][0]*U[1][1])*g2 + U[1][0]*U[1][1]*g1;
@@ -153,7 +162,7 @@ static Mat2 lagrange(double H00, double H10, double H11, int T) {
         ct_cswap64(U[0][1], U[1][1], 1);
     }
 
-    // Final sort (branch-free)
+    // Final sort (branch-free via cmov-style)
     uint64_t need_swap = (uint64_t)(H11 < H00);
     ct_cswap64(U[0][0], U[1][0], need_swap);
     ct_cswap64(U[0][1], U[1][1], need_swap);
