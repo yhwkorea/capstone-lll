@@ -6,14 +6,16 @@
  *   with Application to SQIsign", TCHES 2025 / ePrint 2025/027
  *
  * Phase 1 arithmetic:
- *   Basis B: int64_t  |  Gram G: rebuilt from B after every basis change
- *   GSO (mu, r): double  |  Lagrange H: double  |  U: int64_t
+ *   Basis B:  __int128  — intermediate norms can exceed int64_t during BKZ
+ *   Gram G:   __int128  — G = B*B^T, rebuilt after every basis change
+ *   GSO:      double    — re-derived from G (sufficient precision for dim 4)
+ *   Lagrange: double    — stable for the projected 2D reduction
+ *   U:        int64_t   — unimodular 2x2 transform (entries bounded by log)
  *
- * Key: G is always rebuilt from B (G = B*B^T) to prevent int64 overflow.
- *      GSO target row is refreshed at the start of each size_red call
- *      to prevent stale mu values from previous operations.
+ * Output: B is cast to int64_t at end (LLL output norms fit in int64_t).
  *
- * TODO Phase 2: incremental G update with __int128 for full CT proof.
+ * TODO Phase 2: prove __int128 suffices for all intermediate values,
+ *              and replace double GSO with exact arithmetic for full CT proof.
  */
 
 #pragma once
@@ -22,8 +24,10 @@
 #include <cmath>
 #include <algorithm>
 
-using Mat4 = std::array<std::array<int64_t, 4>, 4>;
-using Mat2 = std::array<std::array<int64_t, 2>, 2>;
+using i128 = __int128;
+using Mat4  = std::array<std::array<i128, 4>, 4>;   // basis / Gram (128-bit)
+using Mat4i = std::array<std::array<int64_t, 4>, 4>; // output (64-bit)
+using Mat2  = std::array<std::array<int64_t, 2>, 2>; // unimodular
 
 struct GSO4 {
     double mu[4][4] = {};
@@ -42,26 +46,29 @@ inline void ct_cswap64(int64_t &a, int64_t &b, uint64_t cond) {
 }
 
 // ---------------------------------------------------------------------------
-// Gram matrix rebuild: G = B * B^T (exact integer)
+// Gram matrix rebuild: G = B * B^T  (__int128 arithmetic)
 // ---------------------------------------------------------------------------
 
 static void rebuild_gram(const Mat4 &B, Mat4 &G) {
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
-            int64_t s = 0;
+            i128 s = 0;
             for (int k = 0; k < 4; k++) s += B[i][k] * B[j][k];
             G[i][j] = s;
         }
 }
 
 // ---------------------------------------------------------------------------
-// Algorithm 3.1 — Cholesky (fp-GSO from integer Gram matrix)
+// Algorithm 3.1 — Cholesky (fp-GSO from __int128 Gram matrix)
 // ---------------------------------------------------------------------------
 
 static void cholesky_update(const Mat4 &G, GSO4 &gso, int ell, int rho) {
     for (int i = ell; i <= rho; i++) {
         for (int j = 0; j < i; j++) {
-            double rij = (double)G[i][j];
+            double rij = (double)(int64_t)G[i][j];  // cast via int64_t for sign
+            // For large G values, use long double intermediate
+            if (G[i][j] > (i128)4e18 || G[i][j] < -(i128)4e18)
+                rij = (double)G[i][j];
             for (int k = 0; k < j; k++)
                 rij -= gso.mu[j][k] * gso.r[i][k];
             gso.r[i][j]  = rij;
@@ -76,12 +83,10 @@ static void cholesky_update(const Mat4 &G, GSO4 &gso, int ell, int rho) {
 
 // ---------------------------------------------------------------------------
 // Algorithm 3.2 — size_red
-// Freshens GSO for row i, then sweeps j=i-1..0 until fully reduced.
-// After each basis change, rebuilds G and refreshes GSO rows 0..i.
+// Freshens GSO for row i at entry. Sweeps j=i-1..0 until fully reduced.
 // ---------------------------------------------------------------------------
 
 static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
-    // Freshen GSO for target row (rows 0..i-1 assumed already valid)
     cholesky_update(G, gso, i, i);
 
     for (int pass = 0; pass <= i; pass++) {
@@ -89,13 +94,13 @@ static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
         for (int j = i - 1; j >= 0; j--) {
             double mu_val = gso.mu[i][j];
             if (std::abs(mu_val) > 0.5 + 1e-10) {
-                int64_t mu_r = (int64_t)std::round(mu_val);
+                i128 mu_r = (i128)std::round(mu_val);
 
                 for (int k = 0; k < 4; k++)
                     B[i][k] -= mu_r * B[j][k];
 
                 rebuild_gram(B, G);
-                cholesky_update(G, gso, 0, i);  // rows 0..i all refreshed
+                cholesky_update(G, gso, 0, i);
                 any = true;
             }
         }
@@ -146,9 +151,16 @@ static int compute_T_bkz(int bits) {
 
 // ---------------------------------------------------------------------------
 // Algorithm 3.5 — ct_reduce_dim4
+// Input/output: Mat4i (int64_t). Internally uses __int128.
 // ---------------------------------------------------------------------------
 
-void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
+void ct_reduce_dim4(Mat4i &Bout, int norm_bound_bits = 30) {
+    // Lift to __int128 basis
+    Mat4 B;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            B[i][j] = (i128)Bout[i][j];
+
     Mat4 G = {};
     rebuild_gram(B, G);
 
@@ -160,11 +172,8 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
 
     for (int c = 0; c < T_BKZ; c++) {
         for (int i = 0; i < 3; i++) {
-            // size_red freshens gso[i+1] internally
             size_red(B, G, gso, i + 1);
 
-            // Projected Gram matrix H of pi_i([b_i, b_{i+1}])
-            // gso rows 0..i+1 are valid after size_red
             double H00 = gso.r[i][i];
             double H10 = gso.mu[i+1][i] * gso.r[i][i];
             double H11 = gso.mu[i+1][i]*gso.mu[i+1][i]*gso.r[i][i] + gso.r[i+1][i+1];
@@ -172,12 +181,11 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
             Mat2 U = lagrange(H00, H10, H11, T_Lagr);
 
             for (int k = 0; k < 4; k++) {
-                int64_t bi = B[i][k], bi1 = B[i+1][k];
-                B[i][k]   = U[0][0]*bi + U[1][0]*bi1;
-                B[i+1][k] = U[0][1]*bi + U[1][1]*bi1;
+                i128 bi = B[i][k], bi1 = B[i+1][k];
+                B[i][k]   = (i128)U[0][0]*bi + (i128)U[1][0]*bi1;
+                B[i+1][k] = (i128)U[0][1]*bi + (i128)U[1][1]*bi1;
             }
 
-            // Rebuild G and refresh all GSO rows
             rebuild_gram(B, G);
             cholesky_update(G, gso, 0, 3);
 
@@ -189,21 +197,26 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
     // Final full size-reduction pass
     for (int i = 1; i < 4; i++)
         size_red(B, G, gso, i);
+
+    // Cast back to int64_t (output norms are small after LLL)
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            Bout[i][j] = (int64_t)B[i][j];
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-inline Mat4 make_basis(const int64_t data[16]) {
-    Mat4 B;
+inline Mat4i make_basis(const int64_t data[16]) {
+    Mat4i B;
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
             B[i][j] = data[i*4+j];
     return B;
 }
 
-inline int64_t row_norm_sq(const Mat4 &B, int i) {
+inline int64_t row_norm_sq(const Mat4i &B, int i) {
     int64_t s = 0;
     for (int j = 0; j < 4; j++) s += B[i][j]*B[i][j];
     return s;
