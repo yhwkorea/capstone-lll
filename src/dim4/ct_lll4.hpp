@@ -9,9 +9,9 @@
  *   Basis B: int64_t  |  Gram G: rebuilt from B after every basis change
  *   GSO (mu, r): double  |  Lagrange H: double  |  U: int64_t
  *
- * Rebuilding G = B*B^T after every change (instead of incremental updates)
- * prevents both integer overflow and accumulated rounding errors. For dim-4
- * this costs only 64 multiply-adds per step — negligible.
+ * Key: G is always rebuilt from B (G = B*B^T) to prevent int64 overflow.
+ *      GSO target row is refreshed at the start of each size_red call
+ *      to prevent stale mu values from previous operations.
  *
  * TODO Phase 2: incremental G update with __int128 for full CT proof.
  */
@@ -76,10 +76,14 @@ static void cholesky_update(const Mat4 &G, GSO4 &gso, int ell, int rho) {
 
 // ---------------------------------------------------------------------------
 // Algorithm 3.2 — size_red
-// Reduces b_i against b_0..b_{i-1}. Rebuilds G after each step.
+// Freshens GSO for row i, then sweeps j=i-1..0 until fully reduced.
+// After each basis change, rebuilds G and refreshes GSO rows 0..i.
 // ---------------------------------------------------------------------------
 
 static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
+    // Freshen GSO for target row (rows 0..i-1 assumed already valid)
+    cholesky_update(G, gso, i, i);
+
     for (int pass = 0; pass <= i; pass++) {
         bool any = false;
         for (int j = i - 1; j >= 0; j--) {
@@ -87,13 +91,11 @@ static void size_red(Mat4 &B, Mat4 &G, GSO4 &gso, int i) {
             if (std::abs(mu_val) > 0.5 + 1e-10) {
                 int64_t mu_r = (int64_t)std::round(mu_val);
 
-                // Update basis: b_i <- b_i - mu_r * b_j
                 for (int k = 0; k < 4; k++)
                     B[i][k] -= mu_r * B[j][k];
 
-                // Rebuild G exactly and refresh GSO for row i
                 rebuild_gram(B, G);
-                cholesky_update(G, gso, 0, i);
+                cholesky_update(G, gso, 0, i);  // rows 0..i all refreshed
                 any = true;
             }
         }
@@ -158,8 +160,11 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
 
     for (int c = 0; c < T_BKZ; c++) {
         for (int i = 0; i < 3; i++) {
+            // size_red freshens gso[i+1] internally
             size_red(B, G, gso, i + 1);
 
+            // Projected Gram matrix H of pi_i([b_i, b_{i+1}])
+            // gso rows 0..i+1 are valid after size_red
             double H00 = gso.r[i][i];
             double H10 = gso.mu[i+1][i] * gso.r[i][i];
             double H11 = gso.mu[i+1][i]*gso.mu[i+1][i]*gso.r[i][i] + gso.r[i+1][i+1];
@@ -172,6 +177,7 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
                 B[i+1][k] = U[0][1]*bi + U[1][1]*bi1;
             }
 
+            // Rebuild G and refresh all GSO rows
             rebuild_gram(B, G);
             cholesky_update(G, gso, 0, 3);
 
@@ -181,10 +187,8 @@ void ct_reduce_dim4(Mat4 &B, int norm_bound_bits = 30) {
     }
 
     // Final full size-reduction pass
-    for (int i = 1; i < 4; i++) {
-        cholesky_update(G, gso, i, i);
+    for (int i = 1; i < 4; i++)
         size_red(B, G, gso, i);
-    }
 }
 
 // ---------------------------------------------------------------------------
